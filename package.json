@@ -1,0 +1,16 @@
+{
+  "name": "pi-gpt-discipline",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "bench": "bun run benchmarks/run.ts",
+    "test": "bun run benchmarks/run.ts",
+    "replay-trace": "bun run benchmarks/replay.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
