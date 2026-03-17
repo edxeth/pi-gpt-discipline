@@ -48,7 +48,6 @@ export type BashDisciplineResult =
 	| {
 		block: true;
 		category: "mutation" | "inspection";
-		notification: string;
 		reason: string;
 		sampleTarget?: string;
 	};
@@ -469,12 +468,11 @@ function evaluateMutationBlock(
 	return {
 		block: true,
 		category: "mutation",
-		notification: "Shell-based file mutation is blocked here.",
 		sampleTarget,
 		reason:
-			`bash file mutation is blocked in this environment for \`${sampleTarget}\`. `
-			+ "Use read to inspect, edit for localized changes to existing files, and write for new files or full rewrites. "
-			+ `If shell-based file mutation is genuinely required, retry with ${ALLOW_SHELL_EDIT_MARKER} and keep the command narrowly scoped.`,
+			`Bash file mutation is blocked for \`${sampleTarget}\` because it bypasses the built-in file tools. `
+			+ "Use `read` to inspect, `edit` for localized changes to existing files, and `write` for new files or full rewrites. "
+			+ `If shell-based mutation is genuinely required, retry with \`${ALLOW_SHELL_EDIT_MARKER}\` and keep the command narrowly scoped.`,
 	};
 }
 
@@ -486,11 +484,10 @@ function evaluateInspectionBlock(command: string, cwd: string, activeTools: Set<
 			return {
 				block: true,
 				category: "inspection",
-				notification: "Scripted file reads are blocked here.",
 				sampleTarget,
 				reason:
-					`scripted file inspection is blocked in this environment for \`${sampleTarget}\`. `
-					+ "Use read for file contents instead of Python/Node/Bun/Deno wrappers when the read tool is available.",
+					`Scripted file inspection is blocked for \`${sampleTarget}\` because it routes file reads through bash or runtime wrappers instead of the built-in \`read\` tool. `
+					+ "Use `read` directly for file contents.",
 			};
 		}
 	}
@@ -499,9 +496,8 @@ function evaluateInspectionBlock(command: string, cwd: string, activeTools: Set<
 	return {
 		block: true,
 		category: "inspection",
-		notification: "Shell-based workspace inspection is blocked here.",
 		reason:
-			"bash-based workspace inspection is blocked in this environment when equivalent pi tools are available. "
+			"Bash-based workspace inspection is blocked because it bypasses the built-in inspection tools. "
 			+ "Use `ls` for directory listings, `find` for file discovery, `grep` for content search, and `read` for file contents.",
 	};
 }
@@ -543,7 +539,6 @@ export default function gptDisciplineExtension(pi: ExtensionAPI) {
 		});
 		if (!decision.block) return;
 
-		ctx.ui.notify(decision.notification, "warning");
 		return {
 			block: true,
 			reason: decision.reason,

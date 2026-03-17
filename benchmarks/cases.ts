@@ -23,17 +23,15 @@ const noBlock: BashDisciplineResult = { block: false };
 const blockInspection = (sampleTarget?: string): BashDisciplineResult => ({
 	block: true,
 	category: "inspection",
-	notification: sampleTarget ? "Scripted file reads are blocked here." : "Shell-based workspace inspection is blocked here.",
 	reason: sampleTarget
-		? `scripted file inspection is blocked in this environment for \`${sampleTarget}\`. Use read for file contents instead of Python/Node/Bun/Deno wrappers when the read tool is available.`
-		: "bash-based workspace inspection is blocked in this environment when equivalent pi tools are available. Use `ls` for directory listings, `find` for file discovery, `grep` for content search, and `read` for file contents.",
+		? `Scripted file inspection is blocked for \`${sampleTarget}\` because it routes file reads through bash or runtime wrappers instead of the built-in \`read\` tool. Use \`read\` directly for file contents.`
+		: "Bash-based workspace inspection is blocked because it bypasses the built-in inspection tools. Use `ls` for directory listings, `find` for file discovery, `grep` for content search, and `read` for file contents.",
 	sampleTarget,
 });
 const blockMutation = (sampleTarget: string): BashDisciplineResult => ({
 	block: true,
 	category: "mutation",
-	notification: "Shell-based file mutation is blocked here.",
-	reason: `bash file mutation is blocked in this environment for \`${sampleTarget}\`. Use read to inspect, edit for localized changes to existing files, and write for new files or full rewrites. If shell-based file mutation is genuinely required, retry with PI_ALLOW_SHELL_FILE_EDIT=1 and keep the command narrowly scoped.`,
+	reason: `Bash file mutation is blocked for \`${sampleTarget}\` because it bypasses the built-in file tools. Use \`read\` to inspect, \`edit\` for localized changes to existing files, and \`write\` for new files or full rewrites. If shell-based mutation is genuinely required, retry with \`PI_ALLOW_SHELL_FILE_EDIT=1\` and keep the command narrowly scoped.`,
 	sampleTarget,
 });
 
