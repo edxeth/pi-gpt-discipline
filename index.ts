@@ -5,6 +5,15 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 const ALLOW_SHELL_EDIT_MARKER = "PI_ALLOW_SHELL_FILE_EDIT=1";
 const TRACE_FILE_ENV = "PI_GPT_DISCIPLINE_TRACE_FILE";
 const TARGET_MODEL_IDS = new Set(["gpt-5.4", "gpt-5.3-codex"]);
+const REDACTED_ESCAPE_HATCH_CONTEXT_TEXT = "[shell file edit escape hatch omitted from context]";
+const LARGE_BASH_OUTPUT_PRUNE_CHAR_THRESHOLD = 8_000;
+const LARGE_BASH_OUTPUT_PRUNE_LINE_THRESHOLD = 200;
+const LARGE_BASH_CODE_OUTPUT_PRUNE_CHAR_THRESHOLD = 2_000;
+const LARGE_BASH_CODE_OUTPUT_PRUNE_LINE_THRESHOLD = 80;
+const LARGE_BASH_OUTPUT_HEAD_LINES = 12;
+const LARGE_BASH_OUTPUT_TAIL_LINES = 8;
+const LARGE_BASH_OUTPUT_PREVIEW_CHARS = 160;
+const PRUNED_BASH_OUTPUT_PREFIX = "[oversized bash output pruned by pi-gpt-discipline:";
 
 const SAFE_MUTATORS = [
 	/\bprettier\b/i,
@@ -59,6 +68,265 @@ export type BashDisciplineOptions = {
 	activeTools: Iterable<string>;
 	pathExists?: (path: string) => boolean;
 };
+
+type ContextMessageLike = {
+	role: string;
+	content?: unknown;
+	toolCallId?: unknown;
+	toolName?: unknown;
+	isError?: unknown;
+};
+
+function countCommandLines(command: string): number {
+	return command.length === 0 ? 0 : command.split(/\r?\n/).length;
+}
+
+function summarizeBlockedCommand(command: string, decision: Extract<BashDisciplineResult, { block: true }>): string {
+	const lineCount = countCommandLines(command);
+	const charCount = command.length;
+	const details = [
+		decision.category,
+		decision.sampleTarget ? `target ${decision.sampleTarget}` : undefined,
+		`${lineCount} line${lineCount === 1 ? "" : "s"}`,
+		`${charCount} chars`,
+	]
+		.filter((value): value is string => !!value)
+		.join(", ");
+	return `[blocked bash command pruned by pi-gpt-discipline: ${details}]`;
+}
+
+function summarizeWritePayload(path: string, content: string): string | undefined {
+	if (!content) return undefined;
+	const lineCount = countCommandLines(content);
+	const charCount = content.length;
+	const looksLikeCode = looksLikeGeneratedSourceCode(content);
+	const exceedsThreshold = looksLikeCode
+		? charCount > LARGE_BASH_CODE_OUTPUT_PRUNE_CHAR_THRESHOLD || lineCount > LARGE_BASH_CODE_OUTPUT_PRUNE_LINE_THRESHOLD
+		: charCount > LARGE_BASH_OUTPUT_PRUNE_CHAR_THRESHOLD || lineCount > LARGE_BASH_OUTPUT_PRUNE_LINE_THRESHOLD;
+	if (!exceedsThreshold) return undefined;
+	const details = [
+		path ? `path ${path}` : undefined,
+		`${lineCount} line${lineCount === 1 ? "" : "s"}`,
+		`${charCount} chars`,
+		looksLikeCode ? "looks like generated source code" : undefined,
+	]
+		.filter((value): value is string => !!value)
+		.join(", ");
+	return `[oversized write payload pruned by pi-gpt-discipline: ${details}. File write succeeded; use \`read\` if you need the contents again.]`;
+}
+
+export function pruneBlockedAssistantToolCalls<T extends ContextMessageLike>(
+	messages: T[],
+	blockedToolCallSummaries: ReadonlyMap<string, string>,
+): T[] | undefined {
+	if (blockedToolCallSummaries.size === 0) return undefined;
+
+	const blockedToolCallIds = new Set<string>();
+	for (const message of messages) {
+		if (message.role !== "toolResult" || message.isError !== true || typeof message.toolCallId !== "string") continue;
+		if (blockedToolCallSummaries.has(message.toolCallId)) {
+			blockedToolCallIds.add(message.toolCallId);
+		}
+	}
+	if (blockedToolCallIds.size === 0) return undefined;
+
+	let changed = false;
+	const nextMessages = messages.map((message) => {
+		if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
+
+		let messageChanged = false;
+		const nextContent = message.content.map((block) => {
+			if (!block || typeof block !== "object" || !("type" in block) || block.type !== "toolCall") return block;
+			if (!("id" in block) || typeof block.id !== "string" || !("name" in block) || block.name !== "bash") return block;
+			if (!blockedToolCallIds.has(block.id)) return block;
+
+			const compactCommand = blockedToolCallSummaries.get(block.id);
+			if (!compactCommand) return block;
+
+			const args = "arguments" in block && block.arguments && typeof block.arguments === "object"
+				? block.arguments as Record<string, unknown>
+				: {};
+			if (args.command === compactCommand) return block;
+
+			const compactArgs: Record<string, unknown> = { command: compactCommand };
+			if (typeof args.timeout === "number") {
+				compactArgs.timeout = args.timeout;
+			}
+			messageChanged = true;
+			return {
+				...block,
+				arguments: compactArgs,
+			};
+		});
+
+		if (!messageChanged) return message;
+		changed = true;
+		return {
+			...message,
+			content: nextContent,
+		};
+	});
+
+	return changed ? nextMessages : undefined;
+}
+
+export function pruneSuccessfulWriteToolCalls<T extends ContextMessageLike>(messages: T[]): T[] | undefined {
+	const completedWriteToolCallIds = new Set<string>();
+	for (const message of messages) {
+		if (message.role === "toolResult" && message.toolName === "write" && message.isError !== true && typeof message.toolCallId === "string") {
+			completedWriteToolCallIds.add(message.toolCallId);
+		}
+	}
+	if (completedWriteToolCallIds.size === 0) return undefined;
+
+	let changed = false;
+	const nextMessages = messages.map((message) => {
+		if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
+
+		let messageChanged = false;
+		const nextContent = message.content.map((block) => {
+			if (!block || typeof block !== "object" || !("type" in block) || block.type !== "toolCall") return block;
+			if (!("id" in block) || typeof block.id !== "string" || !("name" in block) || block.name !== "write") return block;
+			if (!completedWriteToolCallIds.has(block.id)) return block;
+			if (!("arguments" in block) || !block.arguments || typeof block.arguments !== "object") return block;
+
+			const args = block.arguments as Record<string, unknown>;
+			if (typeof args.path !== "string" || typeof args.content !== "string") return block;
+			const compactContent = summarizeWritePayload(args.path, args.content);
+			if (!compactContent || args.content === compactContent) return block;
+
+			messageChanged = true;
+			return {
+				...block,
+				arguments: {
+					...args,
+					content: compactContent,
+				},
+			};
+		});
+
+		if (!messageChanged) return message;
+		changed = true;
+		return {
+			...message,
+			content: nextContent,
+		};
+	});
+
+	return changed ? nextMessages : undefined;
+}
+
+function redactEscapeHatchString(text: string): string {
+	return text.split(ALLOW_SHELL_EDIT_MARKER).join(REDACTED_ESCAPE_HATCH_CONTEXT_TEXT);
+}
+
+function redactEscapeHatchInValue(value: unknown): { value: unknown; changed: boolean } {
+	if (typeof value === "string") {
+		const redacted = redactEscapeHatchString(value);
+		return redacted === value ? { value, changed: false } : { value: redacted, changed: true };
+	}
+	if (Array.isArray(value)) {
+		let changed = false;
+		const next = value.map((item) => {
+			const result = redactEscapeHatchInValue(item);
+			if (result.changed) changed = true;
+			return result.value;
+		});
+		return changed ? { value: next, changed: true } : { value, changed: false };
+	}
+	if (!value || typeof value !== "object") {
+		return { value, changed: false };
+	}
+
+	let changed = false;
+	const nextEntries = Object.entries(value).map(([key, entryValue]) => {
+		const result = redactEscapeHatchInValue(entryValue);
+		if (result.changed) changed = true;
+		return [key, result.value] as const;
+	});
+	return changed ? { value: Object.fromEntries(nextEntries), changed: true } : { value, changed: false };
+}
+
+export function redactEscapeHatchFromContext<T extends ContextMessageLike>(messages: T[]): T[] | undefined {
+	let changed = false;
+	const nextMessages = messages.map((message) => {
+		if (message.role === "user") return message;
+		const result = redactEscapeHatchInValue(message);
+		if (!result.changed) return message;
+		changed = true;
+		return result.value as T;
+	});
+	return changed ? nextMessages : undefined;
+}
+
+function compactSingleLine(text: string, maxChars = LARGE_BASH_OUTPUT_PREVIEW_CHARS): string {
+	const singleLine = text.replace(/\s+/g, " ").trim();
+	if (singleLine.length <= maxChars) return singleLine;
+	return `${singleLine.slice(0, maxChars - 3)}...`;
+}
+
+function looksLikeGeneratedSourceCode(output: string): boolean {
+	const lines = output.split(/\r?\n/).slice(0, 80);
+	let score = 0;
+	for (const line of lines) {
+		if (/^\s*(?:export|import|class|function|const|let|var|interface|type|enum)\b/.test(line)) score += 2;
+		if (/=>|[{};]/.test(line)) score += 1;
+		if (/^\s*\/\//.test(line)) score += 1;
+	}
+	return score >= 12;
+}
+
+function summarizeLargeBashOutput(output: string, command?: string): string | undefined {
+	if (!output || output.startsWith(PRUNED_BASH_OUTPUT_PREFIX)) return undefined;
+
+	const lineCount = countCommandLines(output);
+	const charCount = output.length;
+	const looksLikeCode = looksLikeGeneratedSourceCode(output);
+	const exceedsThreshold = looksLikeCode
+		? charCount > LARGE_BASH_CODE_OUTPUT_PRUNE_CHAR_THRESHOLD || lineCount > LARGE_BASH_CODE_OUTPUT_PRUNE_LINE_THRESHOLD
+		: charCount > LARGE_BASH_OUTPUT_PRUNE_CHAR_THRESHOLD || lineCount > LARGE_BASH_OUTPUT_PRUNE_LINE_THRESHOLD;
+	if (!exceedsThreshold) return undefined;
+
+	const lines = output.split(/\r?\n/);
+	const head = lines.slice(0, LARGE_BASH_OUTPUT_HEAD_LINES).join("\n").trim();
+	const tail = lines.slice(-LARGE_BASH_OUTPUT_TAIL_LINES).join("\n").trim();
+	const details = [
+		`${lineCount} line${lineCount === 1 ? "" : "s"}`,
+		`${charCount} chars`,
+		looksLikeCode ? "looks like generated source code" : undefined,
+		command ? `command: ${compactSingleLine(command)}` : undefined,
+	]
+		.filter((value): value is string => !!value)
+		.join(", ");
+	const headSection = head ? `\nHead:\n${head}` : "";
+	const tailSection = tail && tail !== head ? `\nTail:\n${tail}` : "";
+	const guidance = looksLikeCode
+		? "Use `write` to create files directly instead of routing large generated source through bash stdout."
+		: "Re-run with a narrower command if you need more detail.";
+	return `${PRUNED_BASH_OUTPUT_PREFIX} ${details}. Full output omitted to protect context budget. ${guidance}]${headSection}${tailSection}`;
+}
+
+export function pruneLargeBashToolResults<T extends ContextMessageLike>(messages: T[]): T[] | undefined {
+	let changed = false;
+	const nextMessages = messages.map((message) => {
+		if (message.role !== "toolResult" || message.toolName !== "bash" || message.isError === true || !Array.isArray(message.content)) {
+			return message;
+		}
+		const textBlocks = message.content.filter((block): block is { type: string; text: string } => (
+			!!block && typeof block === "object" && "type" in block && block.type === "text" && "text" in block && typeof block.text === "string"
+		));
+		if (textBlocks.length === 0) return message;
+		const mergedText = textBlocks.map((block) => block.text).join("\n");
+		const summary = summarizeLargeBashOutput(mergedText);
+		if (!summary) return message;
+		changed = true;
+		return {
+			...message,
+			content: [{ type: "text", text: summary }],
+		};
+	});
+	return changed ? nextMessages : undefined;
+}
 
 function isTargetModelId(modelId: string | null | undefined): boolean {
 	return !!modelId && TARGET_MODEL_IDS.has(modelId);
@@ -429,19 +697,27 @@ function formatSampleTarget(target: string, cwd: string): string {
 	return target.replace(`${cwd}/`, "");
 }
 
-function writeTraceRecord(record: Record<string, unknown>) {
-	const env = typeof globalThis === "object" && "process" in globalThis
+function getProcessEnv(): Record<string, string | undefined> | undefined {
+	return typeof globalThis === "object" && "process" in globalThis
 		? (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
 		: undefined;
-	const traceFile = env?.[TRACE_FILE_ENV];
-	if (!traceFile) return;
+}
+
+function appendJsonlRecord(envVar: string, record: Record<string, unknown>): void {
+	const filePath = getProcessEnv()?.[envVar];
+	if (!filePath) return;
 	try {
-		mkdirSync(dirname(traceFile), { recursive: true });
-		appendFileSync(traceFile, `${JSON.stringify(record)}\n`);
+		mkdirSync(dirname(filePath), { recursive: true });
+		appendFileSync(filePath, `${JSON.stringify(record)}\n`);
 	} catch {
-		// Tracing must never break the guardrail itself.
+		// Debug/tracing must never break the guardrail itself.
 	}
 }
+
+function writeTraceRecord(record: Record<string, unknown>) {
+	appendJsonlRecord(TRACE_FILE_ENV, record);
+}
+
 
 function evaluateMutationBlock(
 	command: string,
@@ -471,8 +747,7 @@ function evaluateMutationBlock(
 		sampleTarget,
 		reason:
 			`Bash file mutation is blocked for \`${sampleTarget}\` because it bypasses the built-in file tools. `
-			+ "Use `read` to inspect, `edit` for localized changes to existing files, and `write` for new files or full rewrites. "
-			+ `If shell-based mutation is genuinely required, retry with \`${ALLOW_SHELL_EDIT_MARKER}\` and keep the command narrowly scoped.`,
+			+ "Use `read` to inspect, `edit` for localized changes to existing files, and `write` for new files or full rewrites.",
 	};
 }
 
@@ -517,6 +792,35 @@ export function evaluateBashDiscipline(options: BashDisciplineOptions): BashDisc
 }
 
 export default function gptDisciplineExtension(pi: ExtensionAPI) {
+	const blockedToolCallSummaries = new Map<string, string>();
+
+	pi.on("session_start", async () => {
+		blockedToolCallSummaries.clear();
+	});
+
+	pi.on("context", async (event) => {
+		const blockedPrunedMessages = pruneBlockedAssistantToolCalls(event.messages, blockedToolCallSummaries) ?? event.messages;
+		const writePrunedMessages = pruneSuccessfulWriteToolCalls(blockedPrunedMessages) ?? blockedPrunedMessages;
+		const outputPrunedMessages = pruneLargeBashToolResults(writePrunedMessages) ?? writePrunedMessages;
+		const redactedMessages = redactEscapeHatchFromContext(outputPrunedMessages);
+		if (blockedPrunedMessages === event.messages && writePrunedMessages === blockedPrunedMessages && outputPrunedMessages === writePrunedMessages && !redactedMessages) return;
+		return { messages: redactedMessages ?? outputPrunedMessages };
+	});
+
+	pi.on("tool_result", async (event, ctx) => {
+		if (!isTargetModel(ctx) || event.toolName !== "bash" || event.isError) return;
+		const text = event.content
+			.filter((block): block is { type: string; text: string } => block.type === "text")
+			.map((block) => block.text)
+			.join("\n");
+		const command = typeof event.input?.command === "string" ? event.input.command : undefined;
+		const summary = summarizeLargeBashOutput(text, command);
+		if (!summary) return;
+		return {
+			content: [{ type: "text", text: summary }],
+		};
+	});
+
 	pi.on("tool_call", async (event, ctx) => {
 		if (!isTargetModel(ctx) || event.toolName !== "bash") return;
 		const command = typeof event.input?.command === "string" ? event.input.command : "";
@@ -538,6 +842,8 @@ export default function gptDisciplineExtension(pi: ExtensionAPI) {
 			decision,
 		});
 		if (!decision.block) return;
+
+		blockedToolCallSummaries.set(event.toolCallId, summarizeBlockedCommand(command, decision));
 
 		return {
 			block: true,

@@ -31,7 +31,7 @@ const blockInspection = (sampleTarget?: string): BashDisciplineResult => ({
 const blockMutation = (sampleTarget: string): BashDisciplineResult => ({
 	block: true,
 	category: "mutation",
-	reason: `Bash file mutation is blocked for \`${sampleTarget}\` because it bypasses the built-in file tools. Use \`read\` to inspect, \`edit\` for localized changes to existing files, and \`write\` for new files or full rewrites. If shell-based mutation is genuinely required, retry with \`PI_ALLOW_SHELL_FILE_EDIT=1\` and keep the command narrowly scoped.`,
+	reason: `Bash file mutation is blocked for \`${sampleTarget}\` because it bypasses the built-in file tools. Use \`read\` to inspect, \`edit\` for localized changes to existing files, and \`write\` for new files or full rewrites.`,
 	sampleTarget,
 });
 

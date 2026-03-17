@@ -36,6 +36,22 @@ The extension watches `bash` tool calls and blocks two classes of behavior when 
     - `rg` / `grep` → `grep`
     - `cat` / `head` / `tail` / `sed` / `awk` (read-only inspection) → `read`
 
+- **Blocked `bash` command compaction in context**
+  - Every blocked `bash` assistant tool call is replaced in future context with a tiny stub.
+  - The stub only remembers what kind of action was attempted plus target/size metadata.
+  - The matching `toolResult` remains responsible for explaining the error.
+
+- **Oversized `bash` output compaction**
+  - Large successful `bash` outputs are compacted before they are fed back to the model.
+  - The compacted result keeps counts plus head/tail previews instead of full payloads.
+  - This especially prevents generated source code dumped to stdout from bloating context.
+  - Older oversized `bash` tool results are also compacted again in the `context` hook before future LLM calls.
+
+- **Oversized `write` payload compaction in context**
+  - After a large `write` succeeds, the matching assistant tool call is compacted in future context.
+  - The model keeps the fact that the file was written, but not the entire file body in conversation history.
+  - If contents are needed again later, the model should use `read`.
+
 ## What it still allows
 The extension intentionally allows shell-based mutation when that is the right tool for the job.
 
@@ -49,6 +65,8 @@ Known allowed patterns include:
 
 ## Escape hatch
 If shell-based file mutation is genuinely required, allow it explicitly by including:
+
+Runtime block messages intentionally do not advertise this escape hatch to the model, and non-user context is redacted before future LLM calls so the model does not learn it from prior assistant/tool messages.
 
 ```bash
 PI_ALLOW_SHELL_FILE_EDIT=1
@@ -67,7 +85,7 @@ PY
 File mutation:
 
 ```text
-bash file mutation is blocked in this environment for `foo.ts`. Use read to inspect, edit for localized changes to existing files, and write for new files or full rewrites. If shell-based file mutation is genuinely required, retry with PI_ALLOW_SHELL_FILE_EDIT=1 and keep the command narrowly scoped.
+bash file mutation is blocked in this environment for `foo.ts`. Use read to inspect, edit for localized changes to existing files, and write for new files or full rewrites.
 ```
 
 Workspace inspection:
